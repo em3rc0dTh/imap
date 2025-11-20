@@ -1,2 +1,4 @@
 /.env
 /venv
+/output
+/app/__pycache__
