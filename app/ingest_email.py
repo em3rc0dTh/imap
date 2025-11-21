@@ -13,6 +13,31 @@ from .config import (
 )
 from .db import is_uid_processed, mark_uid_processed
 from tqdm import tqdm
+from pymongo import MongoClient
+from .config import MONGO_URI, MONGO_DB, MONGO_EMAIL_SETUP_COLLECTION
+client = MongoClient(MONGO_URI)
+db = client[MONGO_DB]
+email_setup_col = db[MONGO_EMAIL_SETUP_COLLECTION]
+imap_config_col = db["imap_config"]
+
+# === Helpers para email setups ===
+def get_email_setups():
+    """
+    Devuelve todos los setups guardados en la BD.
+    """
+    return list(email_setup_col.find({}, {"_id": 0}))
+
+def get_email_setup_by_sender(sender: str):
+    """
+    Retorna el setup cuyo bank_sender coincide con sender
+    """
+    return email_setup_col.find_one({"bank_sender": sender})
+
+# === Helpers para imap config ===
+def get_imap_config():
+    data = imap_config_col.find_one({}, {"_id": 0})
+    return data or {}
+
 
 PDF_EXT_RE = re.compile(r"\.pdf$", re.IGNORECASE)
 
@@ -122,7 +147,11 @@ def connect_and_download_pdfs(
     folder = folder or IMAP_FOLDER
     limit = limit if (limit is not None) else (IMAP_LIMIT or 0)
     client = IMAPClient(IMAP_HOST, port=IMAP_PORT, use_uid=True, ssl=True, timeout=30)
-    client.login(IMAP_USER, IMAP_PASS)
+    imap_config = get_imap_config()
+    if imap_config:
+        client.login(imap_config.get("user"), imap_config.get("password"))
+    else:
+        client.login(IMAP_USER, IMAP_PASS)
     try:
         client.select_folder(folder, readonly=False)
         criteria = _build_search_criteria()
@@ -180,18 +209,36 @@ def connect_and_download_pdfs(
                     date_dt = None
 
                 # filtros en Python (igual que ahora)
-                if IMAP_SENDER_FILTER:
-                    senders = [s.strip().lower() for s in IMAP_SENDER_FILTER.split(",") if s.strip()]
-                    match_sender = False
-                    for _, email_addr in from_:
-                        if any(s in email_addr.lower() for s in senders):
-                            match_sender = True
-                            break
-                    if not match_sender:
-                        if verbose:
-                            print(f"UID {uid} sender {from_str} filtered out")
-                        continue
+                # if IMAP_SENDER_FILTER:
+                #     senders = [s.strip().lower() for s in IMAP_SENDER_FILTER.split(",") if s.strip()]
+                #     match_sender = False
+                #     for _, email_addr in from_:
+                #         if any(s in email_addr.lower() for s in senders):
+                #             match_sender = True
+                #             break
+                #     if not match_sender:
+                #         if verbose:
+                #             print(f"UID {uid} sender {from_str} filtered out")
+                #         continue
 
+                setups = get_email_setups()  # retorna lista de dicts
+                if setups:
+                    senders = [s["bank_sender"].strip().lower() for s in setups if s.get("bank_sender")]
+                else:
+                    # fallback a env
+                    senders = [s.strip().lower() for s in IMAP_SENDER_FILTER.split(",") if s.strip()]
+
+                # Filtrar emails por sender
+                match_sender = False
+                for _, email_addr in from_:
+                    if any(s in email_addr.lower() for s in senders):
+                        match_sender = True
+                        break
+
+                if not match_sender:
+                    if verbose:
+                        print(f"UID {uid} sender {from_str} filtered out")
+                    continue
                 if IMAP_SUBJECT_FILTER:
                     subs = [x.strip().lower() for x in IMAP_SUBJECT_FILTER.split(",") if x.strip()]
                     if not any(sub in subject.lower() for sub in subs):

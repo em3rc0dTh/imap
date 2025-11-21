@@ -24,7 +24,7 @@ client = MongoClient(MONGO_URI)
 db = client[MONGO_DB]
 processed_col = db[MONGO_COLLECTION]
 email_setup_col = db["email_setups"]
-
+imap_config_col = db["imap_config"]
 # processed_col documents structure:
 # { "_id": <uid (int)>, "folder": "<folder>", "message_id": "<Message-ID>", "fetched_at": <datetime>, "subject": "...", "from": "...", "pdfs": [ "path1", ... ] }
 

@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from .db import email_setup_col
+from .db import email_setup_col, imap_config_col
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from .ingest_email import connect_and_download_pdfs
@@ -45,6 +45,21 @@ def save_email_setup(setup: EmailSetup):
 def get_email_setups():
     setups = list(email_setup_col.find({}, {"_id": 0}))  # Omitir _id si quieres
     return setups
+
+class ImapConfig(BaseModel):
+    user: str
+    password: str
+@app.post("/imap/config")
+def save_imap_config(config: ImapConfig):
+    imap_config_col.delete_many({})               # siempre borramos lo anterior
+    imap_config_col.insert_one(config.dict())     # guardamos el único documento
+    return {"status": "success"}
+
+@app.get("/imap/config")
+def get_imap_config():
+    data = imap_config_col.find_one({}, {"_id": 0})
+    return data or {}  
+    
 
 @app.get("/ingest")
 def ingest(
