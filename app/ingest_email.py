@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from datetime import datetime
 from imapclient import IMAPClient, SEEN
 import pyzmail
@@ -15,6 +16,10 @@ from .db import is_uid_processed, mark_uid_processed
 from tqdm import tqdm
 from pymongo import MongoClient
 from .config import MONGO_URI, MONGO_DB, MONGO_EMAIL_SETUP_COLLECTION
+import logging
+
+logger = logging.getLogger(__name__)
+
 client = MongoClient(MONGO_URI)
 db = client[MONGO_DB]
 email_setup_col = db[MONGO_EMAIL_SETUP_COLLECTION]
@@ -41,35 +46,51 @@ def get_imap_config():
 
 PDF_EXT_RE = re.compile(r"\.pdf$", re.IGNORECASE)
 
-def _build_search_criteria():
+def _build_search_criteria(date_from: str = None, date_to: str = None):
     """
-    Build IMAP search criteria list for imapclient.search()
+    Build IMAP search criteria dict for imapclient.search()
+    
+    imapclient usa un formato especial para los criterios.
+    Args:
+        date_from: Fecha inicial (YYYY-MM-DD). Si es None, usa IMAP_DATE_FROM del config
+        date_to: Fecha final (YYYY-MM-DD). Si es None, no filtra hasta hoy
     """
-    criteria = ['ALL']
+    criteria = []
+    
     # Date filter: SINCE <date>
-    if IMAP_DATE_FROM:
-        # Expect YYYY-MM-DD
+    if date_from:
+        try:
+            d = datetime.fromisoformat(date_from)
+            criteria.extend(['SINCE', d.strftime('%d-%b-%Y')])
+            logger.info(f"✅ SINCE filter: {d.strftime('%d-%b-%Y')}")
+        except Exception as e:
+            logger.warning(f"⚠️ Invalid date_from format: {e}")
+    elif IMAP_DATE_FROM:
+        # Fallback a config
         try:
             d = datetime.fromisoformat(IMAP_DATE_FROM)
-            criteria = ['SINCE', d.strftime('%d-%b-%Y')]
+            criteria.extend(['SINCE', d.strftime('%d-%b-%Y')])
+            logger.info(f"✅ SINCE filter (from config): {d.strftime('%d-%b-%Y')}")
         except Exception:
-            # ignore invalid date
             pass
-
-    # If user wants only messages with attachments, some servers support 'HAS', but it's not standardized.
-    # We'll still use HAS if available; otherwise filter later.
-    # Sender filter: allow comma-separated list
-    if IMAP_SENDER_FILTER:
-        senders = [s.strip() for s in IMAP_SENDER_FILTER.split(",") if s.strip()]
-        if len(senders) == 1:
-            criteria += ['FROM', senders[0]]
-        elif len(senders) > 1:
-            # Combine with ORs: (FROM a OR FROM b OR FROM c)
-            # imapclient expects a flat list for complex queries; build manually using OR nesting.
-            # Simpler approach: search ALL and filter in Python.
-            pass
-
-    # Subject filter: will filter in Python
+    
+    # Date filter: BEFORE <date>
+    if date_to:
+        try:
+            d = datetime.fromisoformat(date_to)
+            # Sumar 1 día para incluir todo el día especificado
+            from datetime import timedelta
+            d_next = d + timedelta(days=1)
+            criteria.extend(['BEFORE', d_next.strftime('%d-%b-%Y')])
+            logger.info(f"✅ BEFORE filter: {d_next.strftime('%d-%b-%Y')}")
+        except Exception as e:
+            logger.warning(f"⚠️ Invalid date_to format: {e}")
+    
+    if not criteria:
+        criteria = ['ALL']
+        logger.info("ℹ️ No date filters, using ALL")
+    
+    logger.info(f"📅 Final IMAP search criteria: {criteria}")
     return criteria
 
 def _ensure_bytes(s):
@@ -81,22 +102,32 @@ def _extract_text_html(msg):
     Returns (text_body, html_body)
     """
     # Extract TEXT
+    text_body = None
     if msg.text_part:
         try:
-            text_body = msg.text_part.get_payload().decode(msg.text_part.charset or "utf-8", errors="ignore")
-        except Exception:
+            payload = msg.text_part.get_payload()
+            if payload:
+                if isinstance(payload, bytes):
+                    text_body = payload.decode(msg.text_part.charset or "utf-8", errors="ignore")
+                else:
+                    text_body = str(payload)
+        except Exception as e:
+            logger.warning(f"⚠️ Error extracting text body: {e}")
             text_body = None
-    else:
-        text_body = None
 
     # Extract HTML
+    html_body = None
     if msg.html_part:
         try:
-            html_body = msg.html_part.get_payload().decode(msg.html_part.charset or "utf-8", errors="ignore")
-        except Exception:
+            payload = msg.html_part.get_payload()
+            if payload:
+                if isinstance(payload, bytes):
+                    html_body = payload.decode(msg.html_part.charset or "utf-8", errors="ignore")
+                else:
+                    html_body = str(payload)
+        except Exception as e:
+            logger.warning(f"⚠️ Error extracting html body: {e}")
             html_body = None
-    else:
-        html_body = None
 
     return text_body, html_body
 
@@ -132,64 +163,132 @@ def _extract_pdfs_from_pyzmessage(msg, uid):
             saved.append({"filename": filename, "path": path, "mime": part.type})
     return saved
 
+def _create_imap_client():
+    """Crea y autentica una conexión IMAP con reintentos"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            client = IMAPClient(IMAP_HOST, port=IMAP_PORT, use_uid=True, ssl=True, timeout=60)
+            imap_config = get_imap_config()
+            if imap_config:
+                client.login(imap_config.get("user"), imap_config.get("password"))
+            else:
+                client.login(IMAP_USER, IMAP_PASS)
+            logger.info("✅ IMAP connected successfully")
+            return client
+        except Exception as e:
+            logger.error(f"❌ IMAP connection attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+            else:
+                raise
+
+def _fetch_with_retry(client, batch, fetch_attrs, max_retries=3):
+    """Intenta hacer fetch con reintentos y reconexión"""
+    for attempt in range(max_retries):
+        try:
+            return client.fetch(batch, fetch_attrs)
+        except Exception as e:
+            logger.warning(f"⚠️ Fetch attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                try:
+                    logger.info("🔄 Reconnecting to IMAP...")
+                    client.logout()
+                except:
+                    pass
+                time.sleep(2 ** attempt)
+                client = _create_imap_client()
+            else:
+                raise
+    return {}
+
 def connect_and_download_pdfs(
     limit: int = None,
     folder: str = None,
     mark_processed: bool = True,
     verbose: bool = False,
-    force: bool = False
+    force: bool = False,
+    date_from: str = None,
+    date_to: str = None
 ):
     """
     Connects to IMAP server, searches messages according to config, downloads PDF attachments.
+    
+    Args:
+        limit: Límite de emails a procesar
+        folder: Carpeta IMAP
+        mark_processed: Marcar como procesado en BD
+        verbose: Mostrar logs detallados
+        force: Procesar mensajes aunque ya estén en BD
+        date_from: Fecha inicial (YYYY-MM-DD). Ej: "2024-01-15"
+        date_to: Fecha final (YYYY-MM-DD). Ej: "2024-12-31"
+        
     If force=True -> procesa mensajes aunque ya estén marcados en la BD.
     """
     results = []
     folder = folder or IMAP_FOLDER
     limit = limit if (limit is not None) else (IMAP_LIMIT or 0)
-    client = IMAPClient(IMAP_HOST, port=IMAP_PORT, use_uid=True, ssl=True, timeout=30)
-    imap_config = get_imap_config()
-    if imap_config:
-        client.login(imap_config.get("user"), imap_config.get("password"))
-    else:
-        client.login(IMAP_USER, IMAP_PASS)
+    
+    client = None
     try:
+        client = _create_imap_client()
         client.select_folder(folder, readonly=False)
-        criteria = _build_search_criteria()
+        criteria = _build_search_criteria(date_from=date_from, date_to=date_to)
+        
+        if verbose:
+            logger.info(f"📅 Criterios de búsqueda: {criteria}")
+            if date_from:
+                logger.info(f"   Desde: {date_from}")
+            if date_to:
+                logger.info(f"   Hasta: {date_to}")
+        
         # initial search
         uids = client.search(criteria)
         if not uids:
             if verbose:
-                print("No messages found for criteria:", criteria)
+                logger.info("❌ No messages found for criteria: " + str(criteria))
             return results
 
         uids.sort()
         if limit and limit > 0:
             uids = uids[-limit:]
+            if verbose:
+                logger.info(f"📧 Encontrados {len(uids)} emails (limitados a {limit})")
+        else:
+            if verbose:
+                logger.info(f"📧 Encontrados {len(uids)} emails")
 
         fetch_attrs = ['RFC822', 'BODYSTRUCTURE', 'ENVELOPE']
-        chunk_size = 100
+        chunk_size = 50  # Reducido de 100 a 50 para evitar problemas de conexión
         to_iter = uids
         for i in range(0, len(to_iter), chunk_size):
             batch = to_iter[i:i+chunk_size]
-            resp = client.fetch(batch, fetch_attrs)
+            logger.info(f"📬 Procesando batch {i//chunk_size + 1} ({len(batch)} emails)...")
+            
+            # Fetch con reintentos
+            resp = _fetch_with_retry(client, batch, fetch_attrs, max_retries=3)
+            
+            if not resp:
+                logger.warning(f"⚠️ Batch vacío, continuando...")
+                continue
             for uid, data in resp.items():
                 # <-- aquí está la modificación clave:
                 if not force and is_uid_processed(uid, folder=folder):
                     if verbose:
-                        print(f"Skipping already processed UID {uid}")
+                        logger.info(f"⏭️  Skipping already processed UID {uid}")
                     continue
 
                 raw = data.get(b'RFC822')
                 if not raw:
                     if verbose:
-                        print(f"No RFC822 body for UID {uid}; skipping")
+                        logger.info(f"❌ No RFC822 body for UID {uid}; skipping")
                     continue
 
                 try:
                     msg = pyzmail.PyzMessage.factory(raw)
                 except Exception as e:
                     if verbose:
-                        print(f"Failed parsing message UID {uid}: {e}")
+                        logger.error(f"❌ Failed parsing message UID {uid}: {e}")
                     continue
 
                 # extrae cuerpos, metadatos, PDFs (igual que antes)
@@ -208,18 +307,33 @@ def connect_and_download_pdfs(
                 except Exception:
                     date_dt = None
 
-                # filtros en Python (igual que ahora)
-                # if IMAP_SENDER_FILTER:
-                #     senders = [s.strip().lower() for s in IMAP_SENDER_FILTER.split(",") if s.strip()]
-                #     match_sender = False
-                #     for _, email_addr in from_:
-                #         if any(s in email_addr.lower() for s in senders):
-                #             match_sender = True
-                #             break
-                #     if not match_sender:
-                #         if verbose:
-                #             print(f"UID {uid} sender {from_str} filtered out")
-                #         continue
+                # ===== FILTRO ADICIONAL POR FECHA EN PYTHON =====
+                # Para asegurar que REALMENTE está dentro del rango
+                if date_from or date_to:
+                    if not date_dt:
+                        logger.warning(f"⚠️ UID {uid} sin fecha, saltando")
+                        continue
+                    
+                    email_date = date_dt.date()
+                    
+                    if date_from:
+                        date_from_obj = datetime.fromisoformat(date_from).date()
+                        if email_date < date_from_obj:
+                            logger.warning(f"⚠️ UID {uid} anterior a {date_from} ({email_date}), saltando")
+                            continue
+                    
+                    if date_to:
+                        date_to_obj = datetime.fromisoformat(date_to).date()
+                        if email_date > date_to_obj:
+                            logger.warning(f"⚠️ UID {uid} posterior a {date_to} ({email_date}), saltando")
+                            continue
+                    
+                    logger.info(f"✅ UID {uid} está dentro del rango de fechas ({email_date})")
+
+                ALLOWED_SUBJECT_TERMS = [
+                    "yape", "comprobante", "transferen", "consumo", 
+                    "retiro", "devolución", "cargo", "abono", "movimiento", "operación"
+                ]
 
                 setups = get_email_setups()  # retorna lista de dicts
                 if setups:
@@ -237,19 +351,39 @@ def connect_and_download_pdfs(
 
                 if not match_sender:
                     if verbose:
-                        print(f"UID {uid} sender {from_str} filtered out")
+                        logger.info(f"❌ UID {uid} sender {from_str} filtered out")
                     continue
+                
                 if IMAP_SUBJECT_FILTER:
                     subs = [x.strip().lower() for x in IMAP_SUBJECT_FILTER.split(",") if x.strip()]
                     if not any(sub in subject.lower() for sub in subs):
                         if verbose:
-                            print(f"UID {uid} subject '{subject}' filtered out")
+                            logger.info(f"❌ UID {uid} subject '{subject}' filtered out")
                         continue
+                
+                # Dentro del loop de mensajes
+                subject_lower = subject.lower()
 
+                # Filtrar solo si el asunto contiene alguno de los términos permitidos
+                if not any(term in subject_lower for term in ALLOWED_SUBJECT_TERMS):
+                    if verbose:
+                        logger.info(f"❌ UID {uid} subject '{subject}' filtered out (not a payment/movement)")
+                    continue
+                
                 pdfs = _extract_pdfs_from_pyzmessage(msg, uid)
                 if IMAP_ONLY_WITH_ATTACHMENTS and not pdfs:
                     if verbose:
-                        print(f"UID {uid} has no PDF attachments; skipping due to IMAP_ONLY_WITH_ATTACHMENTS")
+                        logger.info(f"❌ UID {uid} has no PDF attachments; skipping due to IMAP_ONLY_WITH_ATTACHMENTS")
+                    continue
+
+                # ===== VALIDAR QUE TENEMOS DATOS MÍNIMOS =====
+                # No queremos guardar emails completamente vacíos
+                if not any([subject, text_body, html_body, from_str, message_id]):
+                    logger.error(f"❌ UID {uid} completamente vacío, NO PROCESANDO")
+                    continue
+                
+                if not text_body and not html_body:
+                    logger.warning(f"⚠️ UID {uid} sin cuerpo (text_body ni html_body), saltando")
                     continue
 
                 metadata = {
@@ -264,9 +398,10 @@ def connect_and_download_pdfs(
                     "html_body": html_body,
                 }
 
-                # marcar procesado sólo si mark_processed=True
-                if mark_processed:
-                    mark_uid_processed(uid, metadata)
+                logger.info(f"✅ UID {uid} validado correctamente")
+                logger.debug(f"   Subject: {subject[:50] if subject else 'N/A'}")
+                logger.debug(f"   From: {from_str[:50] if from_str else 'N/A'}")
+                logger.debug(f"   Has text: {bool(text_body)}, Has HTML: {bool(html_body)}")
 
                 # flags y move (igual)
                 try:
@@ -283,10 +418,18 @@ def connect_and_download_pdfs(
                         pass
 
                 results.append({"uid": uid, "metadata": metadata})
+            
+            # Pausa entre batches para evitar sobrecargar la conexión
+            if i + chunk_size < len(to_iter):
+                time.sleep(1)
+                
     finally:
-        try:
-            client.logout()
-        except Exception:
-            pass
+        if client:
+            try:
+                client.logout()
+                logger.info("✅ IMAP disconnected")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing IMAP connection: {e}")
 
+    logger.info(f"✅ Descargados {len(results)} emails válidos")
     return results
