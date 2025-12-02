@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import re
 import logging
 from bson import ObjectId
+from fastapi import HTTPException
+from typing import Optional
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -378,29 +380,90 @@ class EmailSetup(BaseModel):
     bank_sender: str
 
 @app.post("/email/setup")
-def save_email_setup(setup: EmailSetup):
-    result = email_setup_col.insert_one(setup.dict())
+def create_email_setup(setup: EmailSetup):
+    doc = setup.dict()
+    doc["created_at"] = datetime.utcnow()
+    doc["updated_at"] = datetime.utcnow()
+    result = email_setup_col.insert_one(doc)
     return {"status": "success", "id": str(result.inserted_id)}
 
 @app.get("/email/setup")
-def get_email_setups():
-    setups = list(email_setup_col.find({}, {"_id": 0}))
+def read_email_setups():
+    setups = list(email_setup_col.find({}))
+    for s in setups:
+        s["id"] = str(s["_id"])
+        del s["_id"]
     return setups
+
+@app.get("/email/setup/{setup_id}")
+def read_email_setup(setup_id: str):
+    setup = email_setup_col.find_one({"_id": ObjectId(setup_id)})
+    if not setup:
+        raise HTTPException(status_code=404, detail="Setup not found")
+    setup["id"] = str(setup["_id"])
+    del setup["_id"]
+    return setup
+
+@app.put("/email/setup/{setup_id}")
+def update_email_setup(setup_id: str, setup: EmailSetup):
+    result = email_setup_col.update_one(
+        {"_id": ObjectId(setup_id)},
+        {"$set": {**setup.dict(), "updated_at": datetime.utcnow()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Setup not found")
+    return {"status": "success"}
+
+@app.delete("/email/setup/{setup_id}")
+def delete_email_setup(setup_id: str):
+    result = email_setup_col.delete_one({"_id": ObjectId(setup_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Setup not found")
+    return {"status": "success"}
 
 class ImapConfig(BaseModel):
     user: str
     password: str
 
 @app.post("/imap/config")
-def save_imap_config(config: ImapConfig):
-    imap_config_col.delete_many({})
-    imap_config_col.insert_one(config.dict())
+def create_imap_config(config: ImapConfig):
+    imap_config_col.update_many({}, {"$set": {"active": False}})
+    doc = config.dict()
+    doc["active"] = True
+    doc["created_at"] = datetime.utcnow()
+    doc["updated_at"] = datetime.utcnow()
+    imap_config_col.insert_one(doc)
     return {"status": "success"}
 
 @app.get("/imap/config")
-def get_imap_config():
-    data = imap_config_col.find_one({}, {"_id": 0})
-    return data or {}
+def get_active_imap_config():
+    config = imap_config_col.find_one({"active": True}, {"_id": 0})
+    return config or {}
+
+@app.get("/imap/config/history")
+def get_imap_config_history():
+    configs = list(imap_config_col.find({}))
+    for c in configs:
+        c["id"] = str(c["_id"])
+        del c["_id"]
+    return configs
+
+@app.put("/imap/config/{config_id}")
+def update_imap_config(config_id: str, config: ImapConfig):
+    result = imap_config_col.update_one(
+        {"_id": ObjectId(config_id)},
+        {"$set": {**config.dict(), "updated_at": datetime.utcnow()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Config not found")
+    return {"status": "success"}
+
+@app.delete("/imap/config/{config_id}")
+def delete_imap_config(config_id: str):
+    result = imap_config_col.delete_one({"_id": ObjectId(config_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Config not found")
+    return {"status": "success"}
 
 @app.get("/ingest")
 def ingest(
