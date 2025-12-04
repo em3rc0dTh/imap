@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from imapclient import IMAPClient, SEEN
 import pyzmail
 from email.utils import parsedate_to_datetime
@@ -46,53 +46,89 @@ def get_imap_config():
 
 PDF_EXT_RE = re.compile(r"\.pdf$", re.IGNORECASE)
 
-def _build_search_criteria(date_from: str = None, date_to: str = None):
+def _build_imap_search_criteria(date_from: str = None, date_to: str = None, senders: list = None, subject_keywords: list = None):
     """
-    Build IMAP search criteria dict for imapclient.search()
+    Build IMAP search criteria for server-side filtering (RFC 3501).
+    All filtering happens on IMAP server, returns only matching UIDs.
     
-    imapclient usa un formato especial para los criterios.
     Args:
-        date_from: Fecha inicial (YYYY-MM-DD). Si es None, usa IMAP_DATE_FROM del config
-        date_to: Fecha final (YYYY-MM-DD). Si es None, no filtra hasta hoy
+        date_from: Start date (YYYY-MM-DD)
+        date_to: End date (YYYY-MM-DD)
+        senders: List of sender email addresses to match
+        subject_keywords: List of keywords that must appear in subject
+    
+    Returns:
+        List representing IMAP search criteria
     """
     criteria = []
     
-    # Date filter: SINCE <date>
+    # === DATE RANGE FILTERS ===
     if date_from:
         try:
             d = datetime.fromisoformat(date_from)
             criteria.extend(['SINCE', d.strftime('%d-%b-%Y')])
             logger.info(f"✅ SINCE filter: {d.strftime('%d-%b-%Y')}")
         except Exception as e:
-            logger.warning(f"⚠️ Invalid date_from format: {e}")
-    elif IMAP_DATE_FROM:
-        # Fallback a config
-        try:
-            d = datetime.fromisoformat(IMAP_DATE_FROM)
-            criteria.extend(['SINCE', d.strftime('%d-%b-%Y')])
-            logger.info(f"✅ SINCE filter (from config): {d.strftime('%d-%b-%Y')}")
-        except Exception:
-            pass
+            logger.warning(f"⚠️ Invalid date_from: {e}")
     
-    # Date filter: BEFORE <date>
     if date_to:
         try:
             d = datetime.fromisoformat(date_to)
-            # Sumar 1 día para incluir todo el día especificado
-            from datetime import timedelta
             d_next = d + timedelta(days=1)
             criteria.extend(['BEFORE', d_next.strftime('%d-%b-%Y')])
             logger.info(f"✅ BEFORE filter: {d_next.strftime('%d-%b-%Y')}")
         except Exception as e:
-            logger.warning(f"⚠️ Invalid date_to format: {e}")
+            logger.warning(f"⚠️ Invalid date_to: {e}")
+    
+    # === SENDER FILTER (OR condition) ===
+    # Only add if we have senders and they're not empty
+    valid_senders = [s.strip() for s in (senders or []) if s and s.strip()]
+    if valid_senders:
+        if len(valid_senders) == 1:
+            criteria.extend(['FROM', valid_senders[0]])
+            logger.info(f"✅ FROM filter: {valid_senders[0]}")
+        else:
+            # Build nested OR: (FROM a OR FROM b OR FROM c)
+            or_clause = None
+            for sender in reversed(valid_senders):
+                if or_clause is None:
+                    or_clause = ['FROM', sender]
+                else:
+                    or_clause = ['OR', 'FROM', sender, or_clause]
+            
+            if or_clause:
+                criteria.append(or_clause)
+                logger.info(f"✅ FROM filter (OR): {valid_senders}")
+    
+    # === SUBJECT FILTER (OR condition) ===
+    # At least ONE keyword must match
+    valid_keywords = [k.strip() for k in (subject_keywords or []) if k and k.strip()]
+    if valid_keywords:
+        if len(valid_keywords) == 1:
+            criteria.extend(['SUBJECT', valid_keywords[0]])
+            logger.info(f"✅ SUBJECT filter: {valid_keywords[0]}")
+        else:
+            # Build nested OR: (SUBJECT a OR SUBJECT b OR SUBJECT c)
+            or_clause = None
+            for keyword in reversed(valid_keywords):
+                if or_clause is None:
+                    or_clause = ['SUBJECT', keyword]
+                else:
+                    or_clause = ['OR', 'SUBJECT', keyword, or_clause]
+            
+            if or_clause:
+                criteria.append(or_clause)
+                logger.info(f"✅ SUBJECT filter (OR): {valid_keywords}")
+    
+    # === EXCLUDE DEVOLUCIONES (optional - comment out if needed) ===
+    # criteria.extend(['NOT', 'SUBJECT', 'devolución'])
     
     if not criteria:
         criteria = ['ALL']
-        logger.info("ℹ️ No date filters, using ALL")
+        logger.info("ℹ️ No filters applied, using ALL")
     
-    logger.info(f"📅 Final IMAP search criteria: {criteria}")
+    logger.info(f"📋 Final IMAP criteria: {criteria}")
     return criteria
-
 def _ensure_bytes(s):
     return s if isinstance(s, bytes) else s.encode("utf-8", errors="ignore")
 
@@ -202,6 +238,91 @@ def _fetch_with_retry(client, batch, fetch_attrs, max_retries=3):
                 raise
     return {}
 
+def _build_imap_search_criteria(date_from: str = None, date_to: str = None, senders: list = None, subject_keywords: list = None):
+    """
+    Build IMAP search criteria for server-side filtering (RFC 3501).
+    All filtering happens on IMAP server, returns only matching UIDs.
+    
+    Args:
+        date_from: Start date (YYYY-MM-DD)
+        date_to: End date (YYYY-MM-DD)
+        senders: List of sender email addresses to match
+        subject_keywords: List of keywords that must appear in subject
+    
+    Returns:
+        List representing IMAP search criteria
+    """
+    criteria = []
+    
+    # === DATE RANGE FILTERS ===
+    if date_from:
+        try:
+            d = datetime.fromisoformat(date_from)
+            criteria.extend(['SINCE', d.strftime('%d-%b-%Y')])
+            logger.info(f"✅ SINCE filter: {d.strftime('%d-%b-%Y')}")
+        except Exception as e:
+            logger.warning(f"⚠️ Invalid date_from: {e}")
+    
+    if date_to:
+        try:
+            d = datetime.fromisoformat(date_to)
+            d_next = d + timedelta(days=1)
+            criteria.extend(['BEFORE', d_next.strftime('%d-%b-%Y')])
+            logger.info(f"✅ BEFORE filter: {d_next.strftime('%d-%b-%Y')}")
+        except Exception as e:
+            logger.warning(f"⚠️ Invalid date_to: {e}")
+    
+    # === SENDER FILTER (OR condition) ===
+    # Only add if we have senders and they're not empty
+    valid_senders = [s.strip() for s in (senders or []) if s and s.strip()]
+    if valid_senders:
+        if len(valid_senders) == 1:
+            criteria.extend(['FROM', valid_senders[0]])
+            logger.info(f"✅ FROM filter: {valid_senders[0]}")
+        else:
+            # Build nested OR: (FROM a OR FROM b OR FROM c)
+            or_clause = None
+            for sender in reversed(valid_senders):
+                if or_clause is None:
+                    or_clause = ['FROM', sender]
+                else:
+                    or_clause = ['OR', 'FROM', sender, or_clause]
+            
+            if or_clause:
+                criteria.append(or_clause)
+                logger.info(f"✅ FROM filter (OR): {valid_senders}")
+    
+    # === SUBJECT FILTER (OR condition) ===
+    # At least ONE keyword must match
+    valid_keywords = [k.strip() for k in (subject_keywords or []) if k and k.strip()]
+    if valid_keywords:
+        if len(valid_keywords) == 1:
+            criteria.extend(['SUBJECT', valid_keywords[0]])
+            logger.info(f"✅ SUBJECT filter: {valid_keywords[0]}")
+        else:
+            # Build nested OR: (SUBJECT a OR SUBJECT b OR SUBJECT c)
+            or_clause = None
+            for keyword in reversed(valid_keywords):
+                if or_clause is None:
+                    or_clause = ['SUBJECT', keyword]
+                else:
+                    or_clause = ['OR', 'SUBJECT', keyword, or_clause]
+            
+            if or_clause:
+                criteria.append(or_clause)
+                logger.info(f"✅ SUBJECT filter (OR): {valid_keywords}")
+    
+    # === EXCLUDE DEVOLUCIONES (optional - comment out if needed) ===
+    # criteria.extend(['NOT', 'SUBJECT', 'devolución'])
+    
+    if not criteria:
+        criteria = ['ALL']
+        logger.info("ℹ️ No filters applied, using ALL")
+    
+    logger.info(f"📋 Final IMAP criteria: {criteria}")
+    return criteria
+
+
 def connect_and_download_pdfs(
     limit: int = None,
     folder: str = None,
@@ -212,18 +333,22 @@ def connect_and_download_pdfs(
     date_to: str = None
 ):
     """
-    Connects to IMAP server, searches messages according to config, downloads PDF attachments.
+    Connects to IMAP server, searches with SERVER-SIDE filtering, downloads PDFs.
+    
+    🚀 KEY OPTIMIZATION: All filtering (date, sender, subject) happens on IMAP server.
+    Only matching UIDs are returned and fetched - no wasted bandwidth or processing.
     
     Args:
-        limit: Límite de emails a procesar
+        limit: Máximo de emails a procesar (últimos N)
         folder: Carpeta IMAP
         mark_processed: Marcar como procesado en BD
         verbose: Mostrar logs detallados
-        force: Procesar mensajes aunque ya estén en BD
+        force: Procesar aunque ya estén en BD
         date_from: Fecha inicial (YYYY-MM-DD). Ej: "2024-01-15"
         date_to: Fecha final (YYYY-MM-DD). Ej: "2024-12-31"
-        
-    If force=True -> procesa mensajes aunque ya estén marcados en la BD.
+    
+    Returns:
+        List of {uid, metadata} dicts
     """
     results = []
     folder = folder or IMAP_FOLDER
@@ -233,159 +358,124 @@ def connect_and_download_pdfs(
     try:
         client = _create_imap_client()
         client.select_folder(folder, readonly=False)
-        criteria = _build_search_criteria(date_from=date_from, date_to=date_to)
+        
+        # === GET FILTERS FROM CONFIG ===
+        setups = get_email_setups()
+        senders = [s["bank_sender"].strip() for s in setups if s.get("bank_sender")]
+        
+        # Subject keywords from config or defaults
+        subject_keywords = []
+        if IMAP_SUBJECT_FILTER:
+            subject_keywords = [x.strip() for x in IMAP_SUBJECT_FILTER.split(",") if x.strip()]
+        else:
+            # Fallback to common payment/movement terms
+            subject_keywords = [
+                "yape", "comprobante", "transferen", "consumo",
+                "retiro", "devolucion", "cargo", "abono", "movimiento", "operacion"
+            ]
+        
+        # === BUILD SERVER-SIDE CRITERIA ===
+        # ✅ Server filters by: date range + sender + subject keywords
+        criteria = _build_imap_search_criteria(
+            date_from=date_from,
+            date_to=date_to,
+            senders=senders,
+            subject_keywords=subject_keywords
+        )
         
         if verbose:
-            logger.info(f"📅 Criterios de búsqueda: {criteria}")
+            logger.info(f"🔍 Server-side search criteria: {criteria}")
             if date_from:
-                logger.info(f"   Desde: {date_from}")
+                logger.info(f"   📅 From: {date_from}")
             if date_to:
-                logger.info(f"   Hasta: {date_to}")
+                logger.info(f"   📅 To: {date_to}")
+            if senders:
+                logger.info(f"   👤 Senders: {', '.join(senders)}")
+            logger.info(f"   🏷️  Keywords: {', '.join(subject_keywords)}")
         
-        # initial search
-        uids = client.search(criteria)
+        # === IMAP SEARCH (server-side filtering) ===
+        # 🚀 FAST: Returns only matching UIDs, not all 100k emails
+        uids = client.search(criteria, charset="UTF-8")
+        
         if not uids:
-            if verbose:
-                logger.info("❌ No messages found for criteria: " + str(criteria))
+            logger.info("✅ No emails matching server-side criteria")
             return results
-
+        
+        logger.info(f"🎯 Server returned {len(uids)} matching UIDs (pre-filtered)")
+        
+        # Sort and apply limit
         uids.sort()
         if limit and limit > 0:
             uids = uids[-limit:]
-            if verbose:
-                logger.info(f"📧 Encontrados {len(uids)} emails (limitados a {limit})")
-        else:
-            if verbose:
-                logger.info(f"📧 Encontrados {len(uids)} emails")
-
+            logger.info(f"📧 Limited to {limit} most recent: {len(uids)} emails to process")
+        
+        # === FETCH IN BATCHES ===
         fetch_attrs = ['RFC822', 'BODYSTRUCTURE', 'ENVELOPE']
-        chunk_size = 50  # Reducido de 100 a 50 para evitar problemas de conexión
-        to_iter = uids
-        for i in range(0, len(to_iter), chunk_size):
-            batch = to_iter[i:i+chunk_size]
-            logger.info(f"📬 Procesando batch {i//chunk_size + 1} ({len(batch)} emails)...")
+        chunk_size = 50
+        
+        for i in range(0, len(uids), chunk_size):
+            batch = uids[i:i+chunk_size]
+            logger.info(f"📬 Batch {i//chunk_size + 1}/{(len(uids)-1)//chunk_size + 1} ({len(batch)} emails)")
             
-            # Fetch con reintentos
             resp = _fetch_with_retry(client, batch, fetch_attrs, max_retries=3)
             
             if not resp:
-                logger.warning(f"⚠️ Batch vacío, continuando...")
+                logger.warning(f"⚠️ Batch empty, continuing...")
                 continue
+            
             for uid, data in resp.items():
-                # <-- aquí está la modificación clave:
+                # === SKIP ALREADY PROCESSED ===
                 if not force and is_uid_processed(uid, folder=folder):
                     if verbose:
-                        logger.info(f"⏭️  Skipping already processed UID {uid}")
+                        logger.info(f"⏭️  UID {uid} already processed, skipping")
                     continue
-
+                
+                # === EXTRACT EMAIL DATA ===
                 raw = data.get(b'RFC822')
                 if not raw:
-                    if verbose:
-                        logger.info(f"❌ No RFC822 body for UID {uid}; skipping")
+                    logger.warning(f"❌ UID {uid} has no RFC822 body")
                     continue
-
+                
                 try:
                     msg = pyzmail.PyzMessage.factory(raw)
                 except Exception as e:
-                    if verbose:
-                        logger.error(f"❌ Failed parsing message UID {uid}: {e}")
+                    logger.error(f"❌ UID {uid} parse error: {e}")
                     continue
-
-                # extrae cuerpos, metadatos, PDFs (igual que antes)
+                
+                # Extract components
                 text_body, html_body = _extract_text_html(msg)
-                envelope = data.get(b'ENVELOPE')
                 subject = msg.get_subject() or ""
-                from_ = msg.get_addresses('from')  # list of tuples (name, email)
-                from_str = ", ".join([f"{n} <{e}>" if n else e for n,e in from_]) if from_ else ""
+                from_ = msg.get_addresses('from') or []
+                from_str = ", ".join([f"{n} <{e}>" if n else e for n, e in from_]) if from_ else ""
                 message_id = msg.get_decoded_header("message-id") or "unknown"
+                
+                # Parse date
                 try:
                     date_header = msg.get('date')
-                    if date_header:
-                        date_dt = parsedate_to_datetime(date_header)
-                    else:
-                        date_dt = None
+                    date_dt = parsedate_to_datetime(date_header) if date_header else None
                 except Exception:
                     date_dt = None
-
-                # ===== FILTRO ADICIONAL POR FECHA EN PYTHON =====
-                # Para asegurar que REALMENTE está dentro del rango
-                if date_from or date_to:
-                    if not date_dt:
-                        logger.warning(f"⚠️ UID {uid} sin fecha, saltando")
-                        continue
-                    
-                    email_date = date_dt.date()
-                    
-                    if date_from:
-                        date_from_obj = datetime.fromisoformat(date_from).date()
-                        if email_date < date_from_obj:
-                            logger.warning(f"⚠️ UID {uid} anterior a {date_from} ({email_date}), saltando")
-                            continue
-                    
-                    if date_to:
-                        date_to_obj = datetime.fromisoformat(date_to).date()
-                        if email_date > date_to_obj:
-                            logger.warning(f"⚠️ UID {uid} posterior a {date_to} ({email_date}), saltando")
-                            continue
-                    
-                    logger.info(f"✅ UID {uid} está dentro del rango de fechas ({email_date})")
-
-                ALLOWED_SUBJECT_TERMS = [
-                    "yape", "comprobante", "transferen", "consumo", 
-                    "retiro", "devolución", "cargo", "abono", "movimiento", "operación"
-                ]
-
-                setups = get_email_setups()  # retorna lista de dicts
-                if setups:
-                    senders = [s["bank_sender"].strip().lower() for s in setups if s.get("bank_sender")]
-                else:
-                    # fallback a env
-                    senders = [s.strip().lower() for s in IMAP_SENDER_FILTER.split(",") if s.strip()]
-
-                # Filtrar emails por sender
-                match_sender = False
-                for _, email_addr in from_:
-                    if any(s in email_addr.lower() for s in senders):
-                        match_sender = True
-                        break
-
-                if not match_sender:
-                    if verbose:
-                        logger.info(f"❌ UID {uid} sender {from_str} filtered out")
-                    continue
                 
-                if IMAP_SUBJECT_FILTER:
-                    subs = [x.strip().lower() for x in IMAP_SUBJECT_FILTER.split(",") if x.strip()]
-                    if not any(sub in subject.lower() for sub in subs):
-                        if verbose:
-                            logger.info(f"❌ UID {uid} subject '{subject}' filtered out")
-                        continue
-                
-                # Dentro del loop de mensajes
-                subject_lower = subject.lower()
-
-                # Filtrar solo si el asunto contiene alguno de los términos permitidos
-                if not any(term in subject_lower for term in ALLOWED_SUBJECT_TERMS):
-                    if verbose:
-                        logger.info(f"❌ UID {uid} subject '{subject}' filtered out (not a payment/movement)")
-                    continue
-                
-                pdfs = _extract_pdfs_from_pyzmessage(msg, uid)
-                if IMAP_ONLY_WITH_ATTACHMENTS and not pdfs:
-                    if verbose:
-                        logger.info(f"❌ UID {uid} has no PDF attachments; skipping due to IMAP_ONLY_WITH_ATTACHMENTS")
-                    continue
-
-                # ===== VALIDAR QUE TENEMOS DATOS MÍNIMOS =====
-                # No queremos guardar emails completamente vacíos
+                # === MINIMAL VALIDATION ===
+                # We trust server-side filtering, but still validate we have content
                 if not any([subject, text_body, html_body, from_str, message_id]):
-                    logger.error(f"❌ UID {uid} completamente vacío, NO PROCESANDO")
+                    logger.error(f"❌ UID {uid} completely empty, skipping")
                     continue
                 
                 if not text_body and not html_body:
-                    logger.warning(f"⚠️ UID {uid} sin cuerpo (text_body ni html_body), saltando")
+                    logger.warning(f"⚠️ UID {uid} has no body content, skipping")
                     continue
-
+                
+                # Extract PDFs
+                pdfs = _extract_pdfs_from_pyzmessage(msg, uid)
+                
+                # Check attachment requirement (only if configured)
+                if IMAP_ONLY_WITH_ATTACHMENTS and not pdfs:
+                    if verbose:
+                        logger.info(f"⏭️  UID {uid} has no PDF attachments")
+                    continue
+                
+                # === BUILD METADATA ===
                 metadata = {
                     "folder": folder,
                     "message_id": message_id,
@@ -397,39 +487,39 @@ def connect_and_download_pdfs(
                     "text_body": text_body,
                     "html_body": html_body,
                 }
-
-                logger.info(f"✅ UID {uid} validado correctamente")
-                logger.debug(f"   Subject: {subject[:50] if subject else 'N/A'}")
-                logger.debug(f"   From: {from_str[:50] if from_str else 'N/A'}")
-                logger.debug(f"   Has text: {bool(text_body)}, Has HTML: {bool(html_body)}")
-
-                # flags y move (igual)
+                
+                logger.info(f"✅ UID {uid} validated")
+                if verbose:
+                    logger.debug(f"   📄 Subject: {subject[:50]}")
+                    logger.debug(f"   👤 From: {from_str[:50]}")
+                    logger.debug(f"   📦 Text: {bool(text_body)}, HTML: {bool(html_body)}")
+                
+                # === MARK AS SEEN / MOVE (if configured) ===
                 try:
                     if MARK_AS_SEEN:
                         client.add_flags(uid, [SEEN])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not mark as seen: {e}")
+                
                 if MOVE_PROCESSED_TO_FOLDER:
                     try:
-                        if MOVE_PROCESSED_TO_FOLDER not in client.list_folders():
-                            client.create_folder(MOVE_PROCESSED_TO_FOLDER)
                         client.move(uid, MOVE_PROCESSED_TO_FOLDER)
-                    except Exception:
-                        pass
-
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not move email: {e}")
+                
                 results.append({"uid": uid, "metadata": metadata})
             
-            # Pausa entre batches para evitar sobrecargar la conexión
-            if i + chunk_size < len(to_iter):
-                time.sleep(1)
-                
+            # Pause between batches
+            if i + chunk_size < len(uids):
+                time.sleep(0.5)
+    
     finally:
         if client:
             try:
                 client.logout()
                 logger.info("✅ IMAP disconnected")
             except Exception as e:
-                logger.warning(f"⚠️ Error closing IMAP connection: {e}")
-
-    logger.info(f"✅ Descargados {len(results)} emails válidos")
+                logger.warning(f"⚠️ Error closing IMAP: {e}")
+    
+    logger.info(f"✅ Downloaded {len(results)} valid emails")
     return results

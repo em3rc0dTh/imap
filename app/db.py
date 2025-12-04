@@ -1,6 +1,6 @@
 from pymongo import MongoClient
 from .config import MONGO_URI, MONGO_DB, MONGO_COLLECTION
-
+#TODO change to multi tenant
 client = MongoClient(MONGO_URI)
 db = client[MONGO_DB]
 raw_emails_col = db[MONGO_COLLECTION]

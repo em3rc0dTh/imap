@@ -473,14 +473,21 @@ def ingest(
     date_to: str | None = Query(default=None, description="Fecha final (YYYY-MM-DD)")
 ):
     """
-    Ingesta emails desde IMAP, guarda raw + processed
+    Ingesta emails desde IMAP, guarda raw + processed.
+    
+    Optimized flow:
+    1. Download emails (server-side filtered by IMAP)
+    2. Detect refunds (devoluciones) - process separately
+    3. Skip consumptions with matching refunds
+    4. Save valid consumptions to raw + processed
     
     Params:
         - limit: Número máximo de emails a procesar
         - force: Si es true, reprocesa emails ya guardados
-        - date_from: Fecha inicial en formato YYYY-MM-DD (ej: 2024-01-15)
-        - date_to: Fecha final en formato YYYY-MM-DD (ej: 2024-12-31)
+        - date_from: Fecha inicial (YYYY-MM-DD)
+        - date_to: Fecha final (YYYY-MM-DD)
     """
+    # ===== STEP 1: Download emails from IMAP =====
     raw_emails = connect_and_download_pdfs(
         limit=limit, 
         force=force,
@@ -488,94 +495,85 @@ def ingest(
         date_to=date_to,
         verbose=True
     )
-    logger.info(f"✅ Descargados {len(raw_emails)} emails")
+    logger.info(f"✅ Downloaded {len(raw_emails)} emails from IMAP")
     
     results = []
     
+    # ===== STEP 2: Process each email =====
     for email_item in raw_emails:
+        uid = email_item.get("uid")
         try:
-            uid = email_item.get("uid")
             metadata = email_item.get("metadata", {})
             
             if not metadata:
-                logger.warning(f"⚠️ Email UID {uid} sin metadata, saltando...")
+                logger.warning(f"⚠️ Email UID {uid} missing metadata, skipping...")
                 continue
             
-            subject = metadata.get("subject")
+            # Extract email components
+            subject = metadata.get("subject", "")
             text_body = metadata.get("text_body")
             html_body = metadata.get("html_body")
-            from_addr = metadata.get("from")
-            message_id = metadata.get("message_id")
+            from_addr = metadata.get("from", "")
+            message_id = metadata.get("message_id", "unknown")
             
-            # Si TODO está vacío, descartar
+            # === Validate minimum data ===
             if not any([subject, text_body, html_body, from_addr, message_id]):
-                logger.error(f"❌ Email UID {uid} completamente vacío, NO GUARDANDO")
-                logger.error(f"   Metadata completa: {metadata}")
+                logger.error(f"❌ UID {uid} completely empty, NOT SAVING")
                 continue
             
-            # Detectar devolución (ANTES DE GUARDAR RAW)
-            is_refund = False
-            amount = 0.0
-            if subject:
-                low = subject.lower()
-                if "devolución" in low or "devolucion" in low:
-                    is_refund = True
-                    amount = parse_email_html(html_body).get("monto", "0").replace(",", "")
+            # === Detect if this is a REFUND (devolución) ===
+            is_refund = "devolución" in subject.lower() or "devolucion" in subject.lower()
             
             if is_refund:
-                logger.info(f"⚠️ UID {uid} es una devolución → NO se guarda RAW ni processed")
-
-                # Seleccionar parser
+                logger.info(f"⚠️ UID {uid} is a REFUND → Processing for transaction matching (NOT saved to DB)")
+                
+                # Select parser
                 if "interbank" in subject.lower() or not html_body:
                     processed_data = parse_interbank(text_body)
                 elif html_body:
                     processed_data = parse_email_html(html_body)
                 else:
                     processed_data = parse_email_text(text_body)
-
-                # Agregar metadata
-                processed_data["message_id"] = metadata.get("message_id", "")
-                processed_data["from"] = metadata.get("from", "")
+                
+                # Add metadata
+                processed_data["message_id"] = message_id
+                processed_data["from"] = from_addr
                 processed_data["subject"] = subject
                 processed_data["date"] = metadata.get("date")
                 processed_data["uid"] = uid
-                processed_data["monto"] = amount
-
-                logger.info(f"📊 Procesando DEVOLUCIÓN UID {uid}: {processed_data}")
+                processed_data["type"] = "devolucion"
                 
-                # Registrar en transacciones (devuelve / empareja)
+                logger.info(f"📊 Processing REFUND UID {uid}: {processed_data}")
+                
+                # Register in transactions (match with consumption)
                 process_transaction(processed_data)
-
-                continue  # No seguir con RAW/PROCESSED
+                
+                # Skip to next email (don't save RAW/PROCESSED)
+                continue
             
-            # --- DESCARTAR CONSUMO SI TIENE DEVOLUCIÓN MATCHING < 2 DÍAS ---
+            # ===== From here on, it's a CONSUMPTION (not a refund) =====
+            
+            # === Check if this consumption has a matching refund (< 2 days, same amount) ===
             if should_skip_consumption(subject, html_body, metadata, raw_emails_col):
-                logger.info(f"⏩ UID {uid}: consumo saltado (tiene devolución matching <2 días). NO guardar RAW/PROCESSED.")
-                continue
-
-
-            if processed_data.get("monto") == amount:
-                logger.info(f"✅ UID {uid} monto coincide con devolución registrada")
+                logger.info(f"⏩ UID {uid}: CONSUMPTION skipped (has matching refund <2 days). NOT SAVING.")
                 continue
             
-            # === Guardar RAW ===
+            # ===== SAVE RAW EMAIL =====
             raw_data = normalize_raw({"uid": uid, **metadata})
             raw_result = raw_emails_col.insert_one(raw_data)
             raw_id = raw_result.inserted_id
+            logger.info(f"✅ Raw email saved: {raw_id} (UID: {uid})")
             
-            logger.info(f"✅ Raw email guardado con ID: {raw_id} (UID: {uid})")
-
-            # Marcar UID procesado
+            # Mark as processed in DB
             try:
                 from .db import mark_uid_processed
                 mark_uid_processed(uid, metadata)
-                logger.info(f"✅ UID {uid} marcado como procesado")
+                logger.info(f"✅ UID {uid} marked as processed")
             except Exception as e:
-                logger.warning(f"⚠️ Error marcando como procesado: {e}")
+                logger.warning(f"⚠️ Error marking as processed: {e}")
             
-            # === PROCESAR EMAIL ===
-            # El subject/text/html ya estaban obtenidos arriba, no es necesario reobtenerlos
-            
+            # ===== PARSE & PROCESS EMAIL =====
+            # Select appropriate parser
             if "interbank" in subject.lower() or not html_body:
                 processed_data = parse_interbank(text_body)
             elif html_body:
@@ -583,35 +581,38 @@ def ingest(
             else:
                 processed_data = parse_email_text(text_body)
             
-            # Metadata adicional
-            processed_data["message_id"] = metadata.get("message_id", "unknown")
-            processed_data["from"] = metadata.get("from", "")
+            # Add metadata
+            processed_data["message_id"] = message_id
+            processed_data["from"] = from_addr
             processed_data["subject"] = subject
             processed_data["date"] = metadata.get("date")
             processed_data["uid"] = uid
             processed_data["raw_email_id"] = raw_id
             processed_data["processed_at"] = datetime.utcnow()
-
-            logger.info(f"📊 Datos procesados UID {uid}: {processed_data}")
+            processed_data["type"] = "consumo"
             
-            # === Guardar processed ===
+            logger.info(f"📊 Processed data UID {uid}: {processed_data}")
+            
+            # ===== SAVE PROCESSED EMAIL =====
             processed_result = processed_emails_col.insert_one(processed_data)
-            logger.info(f"✅ Processed email guardado con ID: {processed_result.inserted_id}")
+            logger.info(f"✅ Processed email saved: {processed_result.inserted_id}")
             
+            # Add to results
             results.append({
                 "uid": uid,
                 "raw_id": str(raw_id),
                 "processed_id": str(processed_result.inserted_id),
                 "subject": subject,
                 "monto": processed_data.get("monto", "-"),
-                "nroOperacion": processed_data.get("nroOperacion", "-")
+                "nroOperacion": processed_data.get("nroOperacion", "-"),
+                "type": "consumo"
             })
         
         except Exception as e:
-            logger.error(f"❌ Error procesando email UID {uid}: {e}", exc_info=True)
+            logger.error(f"❌ Error processing UID {uid}: {e}", exc_info=True)
             continue
-
-    logger.info(f"✅ Ingesta completada: {len(results)} emails procesados")
+    
+    logger.info(f"✅ Ingest completed: {len(results)} consumptions processed")
     
     return {
         "count": len(results),
