@@ -2,13 +2,9 @@ fastapi
 uvicorn[standard]
 pymongo
 pandas
-pdf2image
-pytesseract
 imapclient
 pyzmail36
 python-dotenv
-sentence-transformers
-scikit-learn
 requests
 python-multipart
 tqdm

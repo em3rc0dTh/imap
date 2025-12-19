@@ -44,3 +44,19 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 # Behavior
 MOVE_PROCESSED_TO_FOLDER = os.getenv("MOVE_PROCESSED_TO_FOLDER", "").strip()  # e.g. "Processed"
 MARK_AS_SEEN = os.getenv("MARK_AS_SEEN", "true").lower() in ("1","true","yes")
+
+# ============================================================================
+# 🆕 FASE 4 - IMAP LIFECYCLE CONFIGURATION
+# ============================================================================
+
+# Intervalo de polling en segundos (cada cuánto revisar emails nuevos)
+IMAP_POLL_INTERVAL = int(os.getenv("IMAP_POLL_INTERVAL", "60"))  # 60 segundos por defecto
+
+# Backoff para reconexión (segundos base para exponential backoff)
+IMAP_RECONNECT_BACKOFF = int(os.getenv("IMAP_RECONNECT_BACKOFF", "5"))  # 5 segundos
+
+# Máximo de reintentos antes de abortar
+IMAP_MAX_RETRIES = int(os.getenv("IMAP_MAX_RETRIES", "5"))  # 5 reintentos
+
+# Habilitar modo persistente (loop infinito)
+IMAP_PERSISTENT_MODE = os.getenv("IMAP_PERSISTENT_MODE", "false").lower() in ("1", "true", "yes")

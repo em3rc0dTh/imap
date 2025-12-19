@@ -10,59 +10,72 @@ from .config import (
     IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS, IMAP_FOLDER,
     IMAP_SENDER_FILTER, IMAP_SUBJECT_FILTER, IMAP_DATE_FROM,
     IMAP_LIMIT, IMAP_ONLY_WITH_ATTACHMENTS, PDF_SAVE_DIR,
-    MOVE_PROCESSED_TO_FOLDER, MARK_AS_SEEN
+    MOVE_PROCESSED_TO_FOLDER, MARK_AS_SEEN,
+    MONGO_URI, MONGO_DB, MONGO_EMAIL_SETUP_COLLECTION,
+    MONGO_COLLECTION
 )
 from .db import is_uid_processed, mark_uid_processed
-from tqdm import tqdm
 from pymongo import MongoClient
-from .config import MONGO_URI, MONGO_DB, MONGO_EMAIL_SETUP_COLLECTION
 import logging
 
 logger = logging.getLogger(__name__)
 
+# Clientes MongoDB (fallback)
 client = MongoClient(MONGO_URI)
 db = client[MONGO_DB]
 email_setup_col = db[MONGO_EMAIL_SETUP_COLLECTION]
+raw_emails_col = db[MONGO_COLLECTION]
 imap_config_col = db["imap_config"]
-
-# === Helpers para email setups ===
-def get_email_setups():
-    """
-    Devuelve todos los setups guardados en la BD.
-    """
-    return list(email_setup_col.find({}, {"_id": 0}))
-
-def get_email_setup_by_sender(sender: str):
-    """
-    Retorna el setup cuyo bank_sender coincide con sender
-    """
-    return email_setup_col.find_one({"bank_sender": sender})
-
-# === Helpers para imap config ===
-def get_imap_config():
-    data = imap_config_col.find_one({}, {"_id": 0})
-    return data or {}
-
 
 PDF_EXT_RE = re.compile(r"\.pdf$", re.IGNORECASE)
 
-def _build_imap_search_criteria(date_from: str = None, date_to: str = None, senders: list = None, subject_keywords: list = None):
+
+def resolve_imap_folder(imap, folder_name):
+    """Resuelve el nombre de la carpeta IMAP (ej: All Mail en Gmail)"""
+    if folder_name.upper() == "INBOX":
+        return "INBOX"
+
+    try:
+        folders = imap.list_folders()
+    except Exception as e:
+        logger.error(f"❌ Error al listar carpetas IMAP: {e}")
+        return "INBOX"
+
+    possible_names = [
+        "All Mail", "[Gmail]/All Mail", "[Google Mail]/All Mail",
+        "Todos", "[Gmail]/Todos", "Todos los mensajes",
+        "[Gmail]/Todos los mensajes", "Archive", "[Gmail]/Archive",
+    ]
+
+    for flags, delimiter, mailbox in folders:
+        mailbox_str = mailbox
+        for name in possible_names:
+            if name.lower() in mailbox_str.lower():
+                logger.info(f"✔ IMAP folder detectado: {mailbox_str}")
+                return mailbox_str
+
+    logger.warning("⚠ No se encontró ALL MAIL/TODOS, usando INBOX")
+    return "INBOX"
+
+def _build_imap_search_criteria(
+    date_from: str = None,
+    date_to: str = None,
+    senders: list = None,
+    subject_keywords: list = None
+):
     """
-    Build IMAP search criteria for server-side filtering (RFC 3501).
-    All filtering happens on IMAP server, returns only matching UIDs.
+    Construye criterios de búsqueda IMAP (RFC 3501).
     
-    Args:
-        date_from: Start date (YYYY-MM-DD)
-        date_to: End date (YYYY-MM-DD)
-        senders: List of sender email addresses to match
-        subject_keywords: List of keywords that must appear in subject
+    IMPORTANTE: SUBJECT en IMAP busca palabras completas, no subcadenas.
+    Para "yape" → encuentra "Yapeo exitoso" ✅
+    Para "transferen" → NO encuentra "transferencia" ❌
     
-    Returns:
-        List representing IMAP search criteria
+    SOLUCIÓN: Si hay keywords problemáticos, hacer búsqueda solo por FROM
+    y filtrar por SUBJECT en el lado del cliente.
     """
     criteria = []
     
-    # === DATE RANGE FILTERS ===
+    # === FILTROS DE FECHA ===
     if date_from:
         try:
             d = datetime.fromisoformat(date_from)
@@ -80,15 +93,13 @@ def _build_imap_search_criteria(date_from: str = None, date_to: str = None, send
         except Exception as e:
             logger.warning(f"⚠️ Invalid date_to: {e}")
     
-    # === SENDER FILTER (OR condition) ===
-    # Only add if we have senders and they're not empty
+    # === FILTRO DE REMITENTES (OR) ===
     valid_senders = [s.strip() for s in (senders or []) if s and s.strip()]
     if valid_senders:
         if len(valid_senders) == 1:
             criteria.extend(['FROM', valid_senders[0]])
             logger.info(f"✅ FROM filter: {valid_senders[0]}")
         else:
-            # Build nested OR: (FROM a OR FROM b OR FROM c)
             or_clause = None
             for sender in reversed(valid_senders):
                 if or_clause is None:
@@ -100,28 +111,17 @@ def _build_imap_search_criteria(date_from: str = None, date_to: str = None, send
                 criteria.append(or_clause)
                 logger.info(f"✅ FROM filter (OR): {valid_senders}")
     
-    # === SUBJECT FILTER (OR condition) ===
-    # At least ONE keyword must match
+    # === FILTRO DE SUBJECT (FLEXIBLE) ===
+    # 🔥 CAMBIO: No filtrar por SUBJECT en servidor, hacerlo en cliente
+    # Razón: IMAP SUBJECT busca palabras completas, no subcadenas
+    # "transferen" no encuentra "transferencia"
+    # "devolucion" no encuentra "devolución" (por tilde)
+    
     valid_keywords = [k.strip() for k in (subject_keywords or []) if k and k.strip()]
     if valid_keywords:
-        if len(valid_keywords) == 1:
-            criteria.extend(['SUBJECT', valid_keywords[0]])
-            logger.info(f"✅ SUBJECT filter: {valid_keywords[0]}")
-        else:
-            # Build nested OR: (SUBJECT a OR SUBJECT b OR SUBJECT c)
-            or_clause = None
-            for keyword in reversed(valid_keywords):
-                if or_clause is None:
-                    or_clause = ['SUBJECT', keyword]
-                else:
-                    or_clause = ['OR', 'SUBJECT', keyword, or_clause]
-            
-            if or_clause:
-                criteria.append(or_clause)
-                logger.info(f"✅ SUBJECT filter (OR): {valid_keywords}")
-    
-    # === EXCLUDE DEVOLUCIONES (optional - comment out if needed) ===
-    # criteria.extend(['NOT', 'SUBJECT', 'devolución'])
+        logger.info(f"⚠️ SUBJECT keywords will be filtered CLIENT-SIDE: {valid_keywords}")
+        logger.info(f"   Reason: IMAP SUBJECT only matches whole words, not substrings")
+        # NO agregar criterios SUBJECT al servidor
     
     if not criteria:
         criteria = ['ALL']
@@ -129,15 +129,9 @@ def _build_imap_search_criteria(date_from: str = None, date_to: str = None, send
     
     logger.info(f"📋 Final IMAP criteria: {criteria}")
     return criteria
-def _ensure_bytes(s):
-    return s if isinstance(s, bytes) else s.encode("utf-8", errors="ignore")
 
 def _extract_text_html(msg):
-    """
-    Extract text/plain and text/html bodies from a pyzmail.PyzMessage.
-    Returns (text_body, html_body)
-    """
-    # Extract TEXT
+    """Extrae text/plain y text/html de un mensaje pyzmail"""
     text_body = None
     if msg.text_part:
         try:
@@ -149,9 +143,7 @@ def _extract_text_html(msg):
                     text_body = str(payload)
         except Exception as e:
             logger.warning(f"⚠️ Error extracting text body: {e}")
-            text_body = None
 
-    # Extract HTML
     html_body = None
     if msg.html_part:
         try:
@@ -163,164 +155,88 @@ def _extract_text_html(msg):
                     html_body = str(payload)
         except Exception as e:
             logger.warning(f"⚠️ Error extracting html body: {e}")
-            html_body = None
 
     return text_body, html_body
 
 
 def _save_attachment(uid, filename, part):
-    """
-    Save attachment bytes to disk. part.get_payload() may return bytes already for pyzmail parts.
-    """
+    """Guarda un attachment en disco"""
     safe_name = filename.replace("/", "_").replace("\\", "_")
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     fname = f"{uid}_{timestamp}_{safe_name}"
     path = Path(PDF_SAVE_DIR) / fname
-    payload = part.get_payload()  # bytes
-    # Ensure bytes
+    payload = part.get_payload()
+    
     if isinstance(payload, str):
         payload = payload.encode("utf-8", errors="ignore")
+    
     with open(path, "wb") as f:
         f.write(payload)
+    
     return str(path.resolve())
 
+
 def _extract_pdfs_from_pyzmessage(msg, uid):
-    """
-    Given a pyzmail.PyzMessage, iterate through its parts and collect all pdf attachments.
-    Returns list of paths saved.
-    """
+    """Extrae PDFs de un mensaje pyzmail"""
     saved = []
-    # pyzmail exposes mailparts
     for part in msg.mailparts:
-        # part.filename may be None; part.type contains MIME type
         filename = part.filename
         if filename and PDF_EXT_RE.search(filename):
             path = _save_attachment(uid, filename, part)
             saved.append({"filename": filename, "path": path, "mime": part.type})
     return saved
 
-def _create_imap_client():
-    """Crea y autentica una conexión IMAP con reintentos"""
+
+def _create_imap_client(db_name: str = None):
+    """
+    Crea y autentica una conexión IMAP con reintentos.
+    Soporte multi-tenant: usa config de la BD del tenant si se proporciona.
+    """
     max_retries = 3
+    
+    # Obtener configuración IMAP (de tenant o global)
+    if db_name:
+        from .db import get_tenant_collections
+        cols = get_tenant_collections(db_name)
+        imap_config = cols["imap_config_col"].find_one({"active": True}, {"_id": 0})
+        logger.info(f"📦 Loading IMAP config from tenant DB: {db_name}")
+    else:
+        imap_config = imap_config_col.find_one({"active": True}, {"_id": 0})
+        logger.info("📦 Loading IMAP config from default DB")
+    
     for attempt in range(max_retries):
         try:
             client = IMAPClient(IMAP_HOST, port=IMAP_PORT, use_uid=True, ssl=True, timeout=60)
-            imap_config = get_imap_config()
+            
             if imap_config:
                 client.login(imap_config.get("user"), imap_config.get("password"))
+                logger.info(f"✅ IMAP connected with DB config")
             else:
                 client.login(IMAP_USER, IMAP_PASS)
-            logger.info("✅ IMAP connected successfully")
+                logger.info("✅ IMAP connected with environment config")
+            
             return client
+            
         except Exception as e:
             logger.error(f"❌ IMAP connection attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                time.sleep(2 ** attempt)
             else:
                 raise
 
+
 def _fetch_with_retry(client, batch, fetch_attrs, max_retries=3):
-    """Intenta hacer fetch con reintentos y reconexión"""
+    """Intenta hacer fetch con reintentos"""
     for attempt in range(max_retries):
         try:
             return client.fetch(batch, fetch_attrs)
         except Exception as e:
             logger.warning(f"⚠️ Fetch attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                try:
-                    logger.info("🔄 Reconnecting to IMAP...")
-                    client.logout()
-                except:
-                    pass
                 time.sleep(2 ** attempt)
-                client = _create_imap_client()
             else:
                 raise
     return {}
-
-def _build_imap_search_criteria(date_from: str = None, date_to: str = None, senders: list = None, subject_keywords: list = None):
-    """
-    Build IMAP search criteria for server-side filtering (RFC 3501).
-    All filtering happens on IMAP server, returns only matching UIDs.
-    
-    Args:
-        date_from: Start date (YYYY-MM-DD)
-        date_to: End date (YYYY-MM-DD)
-        senders: List of sender email addresses to match
-        subject_keywords: List of keywords that must appear in subject
-    
-    Returns:
-        List representing IMAP search criteria
-    """
-    criteria = []
-    
-    # === DATE RANGE FILTERS ===
-    if date_from:
-        try:
-            d = datetime.fromisoformat(date_from)
-            criteria.extend(['SINCE', d.strftime('%d-%b-%Y')])
-            logger.info(f"✅ SINCE filter: {d.strftime('%d-%b-%Y')}")
-        except Exception as e:
-            logger.warning(f"⚠️ Invalid date_from: {e}")
-    
-    if date_to:
-        try:
-            d = datetime.fromisoformat(date_to)
-            d_next = d + timedelta(days=1)
-            criteria.extend(['BEFORE', d_next.strftime('%d-%b-%Y')])
-            logger.info(f"✅ BEFORE filter: {d_next.strftime('%d-%b-%Y')}")
-        except Exception as e:
-            logger.warning(f"⚠️ Invalid date_to: {e}")
-    
-    # === SENDER FILTER (OR condition) ===
-    # Only add if we have senders and they're not empty
-    valid_senders = [s.strip() for s in (senders or []) if s and s.strip()]
-    if valid_senders:
-        if len(valid_senders) == 1:
-            criteria.extend(['FROM', valid_senders[0]])
-            logger.info(f"✅ FROM filter: {valid_senders[0]}")
-        else:
-            # Build nested OR: (FROM a OR FROM b OR FROM c)
-            or_clause = None
-            for sender in reversed(valid_senders):
-                if or_clause is None:
-                    or_clause = ['FROM', sender]
-                else:
-                    or_clause = ['OR', 'FROM', sender, or_clause]
-            
-            if or_clause:
-                criteria.append(or_clause)
-                logger.info(f"✅ FROM filter (OR): {valid_senders}")
-    
-    # === SUBJECT FILTER (OR condition) ===
-    # At least ONE keyword must match
-    valid_keywords = [k.strip() for k in (subject_keywords or []) if k and k.strip()]
-    if valid_keywords:
-        if len(valid_keywords) == 1:
-            criteria.extend(['SUBJECT', valid_keywords[0]])
-            logger.info(f"✅ SUBJECT filter: {valid_keywords[0]}")
-        else:
-            # Build nested OR: (SUBJECT a OR SUBJECT b OR SUBJECT c)
-            or_clause = None
-            for keyword in reversed(valid_keywords):
-                if or_clause is None:
-                    or_clause = ['SUBJECT', keyword]
-                else:
-                    or_clause = ['OR', 'SUBJECT', keyword, or_clause]
-            
-            if or_clause:
-                criteria.append(or_clause)
-                logger.info(f"✅ SUBJECT filter (OR): {valid_keywords}")
-    
-    # === EXCLUDE DEVOLUCIONES (optional - comment out if needed) ===
-    # criteria.extend(['NOT', 'SUBJECT', 'devolución'])
-    
-    if not criteria:
-        criteria = ['ALL']
-        logger.info("ℹ️ No filters applied, using ALL")
-    
-    logger.info(f"📋 Final IMAP criteria: {criteria}")
-    return criteria
 
 
 def connect_and_download_pdfs(
@@ -330,86 +246,81 @@ def connect_and_download_pdfs(
     verbose: bool = False,
     force: bool = False,
     date_from: str = None,
-    date_to: str = None
+    date_to: str = None,
+    db_name: str = None
 ):
     """
-    Connects to IMAP server, searches with SERVER-SIDE filtering, downloads PDFs.
+    Conecta a servidor IMAP, busca emails con filtrado HÍBRIDO.
     
-    🚀 KEY OPTIMIZATION: All filtering (date, sender, subject) happens on IMAP server.
-    Only matching UIDs are returned and fetched - no wasted bandwidth or processing.
-    
-    Args:
-        limit: Máximo de emails a procesar (últimos N)
-        folder: Carpeta IMAP
-        mark_processed: Marcar como procesado en BD
-        verbose: Mostrar logs detallados
-        force: Procesar aunque ya estén en BD
-        date_from: Fecha inicial (YYYY-MM-DD). Ej: "2024-01-15"
-        date_to: Fecha final (YYYY-MM-DD). Ej: "2024-12-31"
-    
-    Returns:
-        List of {uid, metadata} dicts
+    ESTRATEGIA:
+    - Filtrado SERVER-SIDE: fecha + remitente (eficiente)
+    - Filtrado CLIENT-SIDE: subject keywords (flexible, soporta subcadenas)
     """
     results = []
-    folder = folder or IMAP_FOLDER
-    limit = limit if (limit is not None) else (IMAP_LIMIT or 0)
+    
+    # === CONFIGURACIÓN MULTI-TENANT ===
+    if db_name:
+        from .db import get_tenant_collections
+        cols = get_tenant_collections(db_name)
+        email_setup_col_target = cols["email_setup_col"]
+        logger.info(f"📦 Using tenant database: {db_name}")
+    else:
+        email_setup_col_target = email_setup_col
+        logger.info(f"📦 Using default database: {MONGO_DB}")
     
     client = None
     try:
-        client = _create_imap_client()
+        # === CONECTAR A IMAP ===
+        client = _create_imap_client(db_name)
+        folder = resolve_imap_folder(client, folder or IMAP_FOLDER)
         client.select_folder(folder, readonly=False)
+        limit = limit if (limit is not None) else (IMAP_LIMIT or 0)
         
-        # === GET FILTERS FROM CONFIG ===
-        setups = get_email_setups()
+        # === OBTENER FILTROS DESDE BD ===
+        setups = list(email_setup_col_target.find({}))
         senders = [s["bank_sender"].strip() for s in setups if s.get("bank_sender")]
         
-        # Subject keywords from config or defaults
+        if verbose and senders:
+            logger.info(f"📧 Found {len(senders)} email setups: {senders}")
+        
+        # Subject keywords (para filtrado CLIENT-SIDE)
         subject_keywords = []
         if IMAP_SUBJECT_FILTER:
             subject_keywords = [x.strip() for x in IMAP_SUBJECT_FILTER.split(",") if x.strip()]
         else:
-            # Fallback to common payment/movement terms
             subject_keywords = [
                 "yape", "comprobante", "transferen", "consumo",
                 "retiro", "devolucion", "cargo", "abono", "movimiento", "operacion"
             ]
         
-        # === BUILD SERVER-SIDE CRITERIA ===
-        # ✅ Server filters by: date range + sender + subject keywords
+        # === CONSTRUIR CRITERIOS IMAP (SIN SUBJECT) ===
         criteria = _build_imap_search_criteria(
             date_from=date_from,
             date_to=date_to,
             senders=senders,
-            subject_keywords=subject_keywords
+            subject_keywords=None  # 🔥 No filtrar SUBJECT en servidor
         )
         
         if verbose:
-            logger.info(f"🔍 Server-side search criteria: {criteria}")
-            if date_from:
-                logger.info(f"   📅 From: {date_from}")
-            if date_to:
-                logger.info(f"   📅 To: {date_to}")
-            if senders:
-                logger.info(f"   👤 Senders: {', '.join(senders)}")
-            logger.info(f"   🏷️  Keywords: {', '.join(subject_keywords)}")
+            logger.info(f"🔍 Server-side criteria: {criteria}")
+            logger.info(f"🔍 Client-side SUBJECT filter: {subject_keywords}")
         
-        # === IMAP SEARCH (server-side filtering) ===
-        # 🚀 FAST: Returns only matching UIDs, not all 100k emails
+        # === BÚSQUEDA IMAP (SERVER-SIDE: fecha + remitente) ===
         uids = client.search(criteria, charset="UTF-8")
         
         if not uids:
             logger.info("✅ No emails matching server-side criteria")
             return results
         
-        logger.info(f"🎯 Server returned {len(uids)} matching UIDs (pre-filtered)")
+        logger.info(f"🎯 Server returned {len(uids)} UIDs (filtered by date + sender)")
         
-        # Sort and apply limit
+        # Ordenar y aplicar limit
         uids.sort()
         if limit and limit > 0:
             uids = uids[-limit:]
-            logger.info(f"📧 Limited to {limit} most recent: {len(uids)} emails to process")
+            logger.info(f"📧 Limited to {limit} most recent")
         
-        # === FETCH IN BATCHES ===
+        # === FETCH EN BATCHES ===
         fetch_attrs = ['RFC822', 'BODYSTRUCTURE', 'ENVELOPE']
         chunk_size = 50
         
@@ -424,13 +335,19 @@ def connect_and_download_pdfs(
                 continue
             
             for uid, data in resp.items():
-                # === SKIP ALREADY PROCESSED ===
-                if not force and is_uid_processed(uid, folder=folder):
-                    if verbose:
-                        logger.info(f"⏭️  UID {uid} already processed, skipping")
-                    continue
+                # Skip already processed
+                if not force:
+                    if db_name:
+                        already_processed = is_uid_processed(uid, folder=folder, db_name=db_name)
+                    else:
+                        already_processed = is_uid_processed(uid, folder=folder)
+                    
+                    if already_processed:
+                        if verbose:
+                            logger.info(f"⏭️  UID {uid} already processed, skipping")
+                        continue
                 
-                # === EXTRACT EMAIL DATA ===
+                # Extract email data
                 raw = data.get(b'RFC822')
                 if not raw:
                     logger.warning(f"❌ UID {uid} has no RFC822 body")
@@ -456,8 +373,22 @@ def connect_and_download_pdfs(
                 except Exception:
                     date_dt = None
                 
-                # === MINIMAL VALIDATION ===
-                # We trust server-side filtering, but still validate we have content
+                # === FILTRADO CLIENT-SIDE: SUBJECT KEYWORDS ===
+                # 🔥 NUEVO: Verificar si el subject contiene ALGUNA keyword
+                subject_lower = subject.lower()
+                
+                if subject_keywords:
+                    matches_keyword = any(kw.lower() in subject_lower for kw in subject_keywords)
+                    
+                    if not matches_keyword:
+                        if verbose:
+                            logger.info(f"⏭️  UID {uid} subject doesn't match keywords: '{subject[:50]}'")
+                        continue
+                    else:
+                        if verbose:
+                            logger.info(f"✅ UID {uid} matches keyword in subject: '{subject[:50]}'")
+                
+                # Validación mínima
                 if not any([subject, text_body, html_body, from_str, message_id]):
                     logger.error(f"❌ UID {uid} completely empty, skipping")
                     continue
@@ -469,13 +400,13 @@ def connect_and_download_pdfs(
                 # Extract PDFs
                 pdfs = _extract_pdfs_from_pyzmessage(msg, uid)
                 
-                # Check attachment requirement (only if configured)
+                # Check attachment requirement
                 if IMAP_ONLY_WITH_ATTACHMENTS and not pdfs:
                     if verbose:
                         logger.info(f"⏭️  UID {uid} has no PDF attachments")
                     continue
                 
-                # === BUILD METADATA ===
+                # Build metadata
                 metadata = {
                     "folder": folder,
                     "message_id": message_id,
@@ -492,9 +423,8 @@ def connect_and_download_pdfs(
                 if verbose:
                     logger.debug(f"   📄 Subject: {subject[:50]}")
                     logger.debug(f"   👤 From: {from_str[:50]}")
-                    logger.debug(f"   📦 Text: {bool(text_body)}, HTML: {bool(html_body)}")
                 
-                # === MARK AS SEEN / MOVE (if configured) ===
+                # Mark as seen / move
                 try:
                     if MARK_AS_SEEN:
                         client.add_flags(uid, [SEEN])
@@ -521,5 +451,188 @@ def connect_and_download_pdfs(
             except Exception as e:
                 logger.warning(f"⚠️ Error closing IMAP: {e}")
     
-    logger.info(f"✅ Downloaded {len(results)} valid emails")
+    logger.info(f"✅ Downloaded {len(results)} valid emails (after client-side filtering)")
+    return results
+
+# ============================================================================
+# 🔬 FUNCIÓN DE DIAGNÓSTICO
+# ============================================================================
+
+def diagnose_imap_search(db_name: str = None):
+    """
+    Diagnostica por qué la búsqueda IMAP no encuentra emails.
+    Ejecuta múltiples tests para identificar el problema exacto.
+    """
+    client = None
+    results = {
+        "total_emails": 0,
+        "from_yape_exact": 0,
+        "from_yape_partial": 0,
+        "with_any_subject": 0,
+        "combined": 0,
+        "sample_emails": [],
+        "issue_detected": None,
+        "alternative_senders": []
+    }
+    
+    try:
+        # Obtener colecciones del tenant
+        if db_name:
+            from .db import get_tenant_collections
+            cols = get_tenant_collections(db_name)
+            email_setup_col_target = cols["email_setup_col"]
+        else:
+            email_setup_col_target = email_setup_col
+        
+        # Crear conexión IMAP
+        client = _create_imap_client(db_name)
+        folder = resolve_imap_folder(client, IMAP_FOLDER)
+        client.select_folder(folder, readonly=True)
+        
+        logger.info("=" * 70)
+        logger.info("🔬 IMAP DIAGNOSTIC MODE")
+        logger.info(f"   Database: {db_name or 'default'}")
+        logger.info(f"   Folder: {folder}")
+        logger.info("=" * 70)
+        
+        # TEST 1: Total emails
+        logger.info("\n📧 TEST 1: Total emails in folder")
+        all_uids = client.search(['ALL'])
+        results["total_emails"] = len(all_uids)
+        logger.info(f"   ✅ Found {len(all_uids)} total emails")
+        
+        if len(all_uids) == 0:
+            results["issue_detected"] = "NO_EMAILS_IN_FOLDER"
+            return results
+        
+        # TEST 2: FROM exact
+        logger.info("\n📧 TEST 2: FROM notificaciones@yape.pe (exact)")
+        try:
+            from_exact = client.search(['FROM', 'notificaciones@yape.pe'])
+            results["from_yape_exact"] = len(from_exact)
+            logger.info(f"   Result: {len(from_exact)} emails")
+        except Exception as e:
+            logger.error(f"   ❌ Search failed: {e}")
+        
+        # TEST 2b: FROM partial
+        logger.info("\n📧 TEST 2b: FROM yape.pe (partial)")
+        try:
+            from_partial = client.search(['FROM', 'yape.pe'])
+            results["from_yape_partial"] = len(from_partial)
+            logger.info(f"   Result: {len(from_partial)} emails")
+        except Exception as e:
+            logger.error(f"   ❌ Search failed: {e}")
+        
+        # TEST 2c: Alternatives
+        logger.info("\n📧 TEST 2c: Alternative senders")
+        alternatives = ['Yape', 'noreply@yape.pe', 'no-reply@yape.pe', 'notificacion@yape.pe', 'info@yape.pe']
+        
+        for alt in alternatives:
+            try:
+                alt_uids = client.search(['FROM', alt])
+                if len(alt_uids) > 0:
+                    logger.info(f"   ✅ FROM '{alt}': {len(alt_uids)} emails")
+                    results["alternative_senders"].append({"sender": alt, "count": len(alt_uids)})
+            except:
+                pass
+        
+        # TEST 3: SUBJECT keywords
+        logger.info("\n📧 TEST 3: SUBJECT keywords")
+        keywords_test = ['yape', 'comprobante', 'transferencia', 'pago', 'yapeo']
+        subject_results = {}
+        
+        for kw in keywords_test:
+            try:
+                kw_uids = client.search(['SUBJECT', kw])
+                subject_results[kw] = len(kw_uids)
+                if len(kw_uids) > 0:
+                    logger.info(f"   ✅ SUBJECT '{kw}': {len(kw_uids)} emails")
+            except Exception as e:
+                logger.warning(f"   ⚠️ SUBJECT '{kw}' failed: {e}")
+        
+        results["with_any_subject"] = max(subject_results.values()) if subject_results else 0
+        
+        # TEST 4: Combined
+        logger.info("\n📧 TEST 4: Combined FROM + SUBJECT")
+        try:
+            combined = client.search(['FROM', 'notificaciones@yape.pe', 'SUBJECT', 'yape'])
+            results["combined"] = len(combined)
+            logger.info(f"   Result: {len(combined)} emails")
+        except Exception as e:
+            logger.error(f"   ❌ Combined search failed: {e}")
+        
+        # TEST 5: Sample emails
+        logger.info("\n📧 TEST 5: Inspecting recent emails")
+        sample_uids = all_uids[-10:] if len(all_uids) >= 10 else all_uids
+        
+        for uid in sample_uids:
+            try:
+                resp = client.fetch([uid], ['ENVELOPE'])
+                if uid not in resp:
+                    continue
+                
+                env = resp[uid].get(b'ENVELOPE')
+                if not env:
+                    continue
+                
+                from_str = "Unknown"
+                if env.from_ and len(env.from_) > 0:
+                    mailbox = env.from_[0].mailbox.decode('utf-8', errors='ignore') if env.from_[0].mailbox else ''
+                    host = env.from_[0].host.decode('utf-8', errors='ignore') if env.from_[0].host else ''
+                    from_str = f"{mailbox}@{host}"
+                
+                subject = "No subject"
+                if env.subject:
+                    subject = env.subject.decode('utf-8', errors='ignore')
+                
+                date_str = "No date"
+                if env.date:
+                    date_str = env.date.decode('utf-8', errors='ignore')
+                
+                email_info = {
+                    "uid": uid,
+                    "from": from_str,
+                    "subject": subject[:80],
+                    "date": date_str
+                }
+                
+                results["sample_emails"].append(email_info)
+                
+                logger.info(f"\n   📬 UID {uid}:")
+                logger.info(f"      From: {from_str}")
+                logger.info(f"      Subject: {subject[:60]}...")
+                
+                if 'yape' in from_str.lower() or 'yape' in subject.lower():
+                    logger.info(f"      🎯 CONTAINS 'yape'")
+            
+            except Exception as e:
+                logger.warning(f"   ⚠️ Could not inspect UID {uid}: {e}")
+        
+        # Diagnostic summary
+        logger.info("\n" + "=" * 70)
+        logger.info("📊 DIAGNOSTIC SUMMARY")
+        logger.info("=" * 70)
+        
+        if results["from_yape_exact"] == 0 and results["from_yape_partial"] == 0:
+            results["issue_detected"] = "NO_EMAILS_FROM_YAPE"
+            logger.error("❌ ISSUE: No emails from Yape found")
+        elif results["combined"] > 0:
+            results["issue_detected"] = None
+            logger.info(f"✅ SUCCESS: Found {results['combined']} matching emails")
+        else:
+            results["issue_detected"] = "UNKNOWN"
+        
+        logger.info("=" * 70)
+        
+    except Exception as e:
+        logger.error(f"❌ Diagnostic failed: {e}", exc_info=True)
+        results["issue_detected"] = f"ERROR: {str(e)}"
+    
+    finally:
+        if client:
+            try:
+                client.logout()
+            except:
+                pass
+    
     return results
