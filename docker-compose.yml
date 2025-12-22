@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  imap:
+    container_name: thradex-imap
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: python run_api.py
