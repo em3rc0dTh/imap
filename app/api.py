@@ -12,7 +12,15 @@ from typing import Optional
 from pymongo import MongoClient
 from .config import MONGO_URI, MONGO_DB
 from bs4 import BeautifulSoup
-        
+import requests
+from datetime import datetime
+import dotenv
+import os
+dotenv.load_dotenv()
+IA_EXTRACT_URL = os.getenv("IA_EXTRACT_URL") or "http://localhost:8080/extract"
+IA_TIMEOUT = 10
+
+
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -75,7 +83,9 @@ def normalize(email_item):
         "html_body": email_item.get("html_body") or "",
         "body": email_item.get("html_body") or email_item.get("text_body") or "",
         "text_body": email_item.get("text_body") or "",
-        "source": email_item.get("source")
+        "source": email_item.get("source"),
+        "transactionVariables": email_item.get("transactionVariables"),
+        "transactionType": email_item.get("transactionType"),
     }
 
 def normalize_raw(email_data):
@@ -654,6 +664,15 @@ def ingest(
             # === GUARDAR RAW EMAIL en BD del tenant ===
             raw_data = normalize_raw({"uid": uid, **metadata})
             raw_data["source"] = "imap"
+            ai_payload = extract_transaction_via_ai(html_body)
+
+            if ai_payload:
+                raw_data["transactionVariables"] = normalize_transaction_variables(
+                    ai_payload.get("transactionVariables")
+                )
+                raw_data["transactionType"] = ai_payload.get("transactionType")
+                raw_data["transactionConfidence"] = ai_payload.get("confidence")
+
             
             try:
                 raw_result = cols["raw_emails_col"].insert_one(raw_data)
@@ -747,6 +766,61 @@ def ingest(
         },
         "emails": results
     }
+
+def extract_transaction_via_ai(html: str) -> dict | None:
+    if not html or len(html.strip()) < 50:
+        return None
+
+    try:
+        resp = requests.post(
+            IA_EXTRACT_URL,
+            json={
+                "html": html,
+                "formato": "dict",
+                "detalles": True
+            },
+            timeout=IA_TIMEOUT
+        )
+
+        if resp.status_code != 200:
+            return None
+
+        return resp.json()
+
+    except requests.RequestException as e:
+        logger.warning(f"⚠️ IA service unreachable: {e}")
+        return None
+
+from datetime import datetime, timedelta
+
+def normalize_transaction_variables(tv: dict | None) -> dict | None:
+    if not tv:
+        return None
+
+    tv_norm = tv.copy()
+    op_date = tv_norm.get("operationDate")
+
+    if not op_date:
+        return tv_norm
+
+    try:
+        if isinstance(op_date, str):
+            dt = datetime.fromisoformat(op_date.replace("Z", "+00:00"))
+        elif isinstance(op_date, datetime):
+            dt = op_date
+        else:
+            raise TypeError
+
+        # 🔴 FORZAR corrección: viene como UTC pero es -05
+        dt = dt + timedelta(hours=5)
+
+        tv_norm["operationDate"] = dt
+
+    except Exception:
+        tv_norm["operationDate"] = None
+
+    return tv_norm
+
 # ============================================================================
 # EMAIL LISTING ENDPOINTS - Multi-tenant aware
 # ============================================================================
