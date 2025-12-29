@@ -289,7 +289,7 @@ def connect_and_download_pdfs(
             subject_keywords = [x.strip() for x in IMAP_SUBJECT_FILTER.split(",") if x.strip()]
         else:
             subject_keywords = [
-                "yape", "comprobante", "transferen", "consumo",
+                "yape", "transferen", "consumo", "constancia", "terceros",
                 "retiro", "devolucion", "cargo", "abono", "movimiento", "operacion"
             ]
         
