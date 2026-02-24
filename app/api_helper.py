@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -39,3 +40,61 @@ def match_and_update_accounts(tv: dict, accounts_col) -> dict:
                     tv[field] = full_number
 
     return tv
+
+
+def parse_amount(value):
+    """Parsea monto a float removiendo símbolos de moneda y comas"""
+    if not value:
+        return 0.0
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    try:
+        # Remover S/, PEN, espacios
+        val = (
+            str(value)
+            .upper()
+            .replace("S/", "")
+            .replace("PEN", "")
+            .replace("USD", "")
+            .replace("$", "")
+            .strip()
+        )
+        # Remover comas (asumiendo que son separadores de miles si hay punto decimal, o decimales si no hay punto)
+        # Caso simple: 1,200.50 -> 1200.50
+        val = val.replace(",", "")
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def parse_date(value):
+    """Intenta parsear fecha de string a datetime"""
+    if not value:
+        return None
+
+    try:
+        # Intentar ISO format primero
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except:
+        pass
+
+    # Formatos comunes
+    formats = [
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%d %b %Y %H:%M",  # 19 Feb 2024 14:30
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(str(value), fmt)
+        except:
+            continue
+
+    return None

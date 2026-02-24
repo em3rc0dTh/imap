@@ -6,7 +6,7 @@ from .db import (
     processed_emails_col,
     get_tenant_db,
 )
-from .api_helper import match_and_update_accounts
+from .api_helper import match_and_update_accounts, parse_amount, parse_date
 from fastapi import FastAPI, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from .ingest_email import connect_and_download_pdfs
@@ -19,10 +19,11 @@ from typing import Optional
 from pymongo import MongoClient
 from .config import MONGO_URI, MONGO_DB
 from bs4 import BeautifulSoup
-import requests
-from datetime import datetime
-import dotenv
+import google.generativeai as genai
+import json
 import os
+import requests
+import dotenv
 
 dotenv.load_dotenv()
 IA_EXTRACT_URL = os.getenv("IA_EXTRACT_URL") or "http://localhost:8080/extract"
@@ -893,7 +894,12 @@ def extract_transaction_via_ai(html: str) -> dict | None:
     try:
         resp = requests.post(
             IA_EXTRACT_URL,
-            json={"html": html, "formato": "dict", "detalles": True},
+            json={
+                "html": html,
+                "provider": "n8n",
+                "formato": "dict",
+                "detalles": True,
+            },
             timeout=IA_TIMEOUT,
         )
 
@@ -988,3 +994,45 @@ def get_raw_email(
     except Exception as e:
         logger.error(f"Error fetching raw email: {e}")
         return {"error": "Invalid ID format"}
+
+
+@app.get("/emails/raw/by-tenant-detail/{tenant_detail_id}")
+def get_raw_emails_by_tenant_detail(
+    tenant_detail_id: str,
+    x_database_name: str = Header(
+        ..., description="Nombre de la base de datos del tenant"
+    ),
+):
+    """
+    Retorna emails raw filtrados por tenant_detail_id.
+    Logica: Busca los senders asociados al tenant_detail_id en EmailSetup
+    y luego filtra los raw emails por esos senders en el campo 'from'.
+    """
+    cols = get_tenant_collections(x_database_name)
+
+    # 1. Obtener senders asociados al tenant_detail_id
+    setups = list(
+        cols["email_setup_col"].find(
+            {"tenant_detail_id": tenant_detail_id}, {"bank_sender": 1, "_id": 0}
+        )
+    )
+
+    bank_senders = [s.get("bank_sender") for s in setups if s.get("bank_sender")]
+
+    if not bank_senders:
+        return []
+
+    # 2. Construir query para buscar en raw_emails (OR condition para senders)
+    # Buscamos que el 'from' CONTENGA alguno de los bank_senders
+    # Usamos regex para ser flexibles "Name <email>" vs "email"
+    sender_queries = [
+        {"from": {"$regex": sender, "$options": "i"}} for sender in bank_senders
+    ]
+
+    if not sender_queries:
+        return []
+
+    query = {"$or": sender_queries}
+
+    emails = list(cols["raw_emails_col"].find(query).sort("date", -1))
+    return [normalize(e) for e in emails]
